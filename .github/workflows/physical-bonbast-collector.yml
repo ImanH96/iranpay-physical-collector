@@ -1,0 +1,24 @@
+name: physical-bonbast-collector
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: physical-bonbast-collector
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Collect Bonbast into IranPay
+        env:
+          IRANPAY_API_BASE: ${{ secrets.IRANPAY_API_BASE }}
+          PHYSICAL_COLLECTOR_SECRET: ${{ secrets.PHYSICAL_COLLECTOR_SECRET }}
+          COLLECTOR_INTERVAL_MS: "30000"
+          COLLECTOR_DURATION_MS: "19800000"
+        run: node scripts/bonbast-collector.mjs
