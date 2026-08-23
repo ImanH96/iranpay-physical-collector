@@ -23,6 +23,6 @@ jobs:
         env:
           IRANPAY_API_BASE: ${{ secrets.IRANPAY_API_BASE }}
           PHYSICAL_COLLECTOR_SECRET: ${{ secrets.PHYSICAL_COLLECTOR_SECRET }}
-          COLLECTOR_INTERVAL_MS: "30000"
-          COLLECTOR_DURATION_MS: "1"
+          COLLECTOR_INTERVAL_MS: "2000"
+          COLLECTOR_DURATION_MS: "25000"
         run: node scripts/bonbast-collector.mjs

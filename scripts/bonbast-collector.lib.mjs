@@ -141,29 +141,34 @@ export function signCollectorPayload(secret, timestamp, payload) {
   return createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
 }
 
-export async function fetchBoardBook(fetchImpl, boards, { ua = DEFAULT_UA, timeoutMs = 20_000 } = {}) {
-  let lastBoardErr = "BOARD_EMPTY";
-  for (const board of boards) {
-    try {
-      const join = board.includes("?") ? "&" : "?";
-      const res = await fetchImpl(`${board}${join}_=${Date.now()}`, {
-        cache: "no-store",
-        signal: AbortSignal.timeout(timeoutMs),
-        headers: { Accept: "text/html", "Accept-Language": "en-US,en;q=0.9", "User-Agent": ua },
-      });
-      if (!res.ok) {
-        lastBoardErr = `BOARD_HTTP_${res.status}`;
-        continue;
+async function fetchOneBoard(fetchImpl, board, { ua, timeoutMs }) {
+  const join = board.includes("?") ? "&" : "?";
+  const res = await fetchImpl(`${board}${join}_=${Date.now()}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { Accept: "text/html", "Accept-Language": "en-US,en;q=0.9", "User-Agent": ua },
+  });
+  if (!res.ok) return { book: null, board, lastBoardErr: `BOARD_HTTP_${res.status}` };
+  const html = await res.text();
+  const book = extractBook(html);
+  if (book) return { book, board, lastBoardErr: null };
+  return { book: null, board, lastBoardErr: "BOARD_EMPTY" };
+}
+
+export async function fetchBoardBook(fetchImpl, boards, { ua = DEFAULT_UA, timeoutMs = 8_000 } = {}) {
+  const results = await Promise.all(
+    boards.map(async (board) => {
+      try {
+        return await fetchOneBoard(fetchImpl, board, { ua, timeoutMs });
+      } catch (e) {
+        return { book: null, board, lastBoardErr: e.message || String(e) };
       }
-      const html = await res.text();
-      const book = extractBook(html);
-      if (book) return { book, board, lastBoardErr: null };
-      lastBoardErr = "BOARD_EMPTY";
-    } catch (e) {
-      lastBoardErr = e.message || String(e);
-    }
-  }
-  return { book: null, board: null, lastBoardErr };
+    }),
+  );
+  const hit = results.find((r) => r.book);
+  if (hit) return hit;
+  const errs = results.map((r) => r.lastBoardErr).filter(Boolean);
+  return { book: null, board: null, lastBoardErr: errs[0] || "BOARD_EMPTY" };
 }
 
 export async function ingestBook(fetchImpl, bases, { secret, book, timeoutMs = 12_000, nowMs = Date.now() }) {
