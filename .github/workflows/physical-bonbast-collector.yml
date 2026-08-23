@@ -1,24 +1,28 @@
 name: physical-bonbast-collector
+# Public repo: GitHub-hosted minutes are free. This is the live Production
+# collector while P2P-IranPay private-repo hosted runners are billing-locked.
+# Short ticks (DURATION_MS=1). Do not run multi-hour sessions that mask
+# BOARD_HTTP_403 as a green 5h job. Fail the job when no observation is ingested.
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 jobs:
-  collect:
+  tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
     concurrency:
-      group: physical-bonbast-collector
+      group: physical-bonbast-tick
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Collect Bonbast into IranPay
+      - name: Ingest one Bonbast observation
         env:
           IRANPAY_API_BASE: ${{ secrets.IRANPAY_API_BASE }}
           PHYSICAL_COLLECTOR_SECRET: ${{ secrets.PHYSICAL_COLLECTOR_SECRET }}
           COLLECTOR_INTERVAL_MS: "30000"
-          COLLECTOR_DURATION_MS: "19800000"
+          COLLECTOR_DURATION_MS: "1"
         run: node scripts/bonbast-collector.mjs
