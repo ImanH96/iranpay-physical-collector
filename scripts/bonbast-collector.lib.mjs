@@ -18,9 +18,10 @@ export function uniqTrim(urls) {
 
 export function boardUrls(env = process.env) {
   return uniqTrim([
-    env.BONBAST_PUBLIC_URL || "https://www.bon-bast.com/",
-    "https://iran-pay.vercel.app/api/physical/bonbast-board",
+    env.BONBAST_JSON_RELAY_URL || "https://iran-pay.vercel.app/api/physical/bonbast-json",
     "https://t.me/s/bonbast",
+    env.BONBAST_RELAY_URL || "https://iran-pay.vercel.app/api/physical/bonbast-board",
+    env.BONBAST_PUBLIC_URL || "https://www.bon-bast.com/",
   ]);
 }
 
@@ -64,7 +65,27 @@ export function extractTelegramBook(html) {
   return best;
 }
 
+export function extractJsonBook(text) {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const data = JSON.parse(trimmed);
+    const book = data && typeof data === "object" && data.book && typeof data.book === "object" ? data.book : data;
+    if (!book || typeof book !== "object") return null;
+    if (book.usd1 || book.usd2 || book.eur1 || book.aed1 || book.cny1) {
+      if (!book._acquisition) book._acquisition = data.acquisition || "json_relay";
+      return book;
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
 export function extractBook(html) {
+  const json = extractJsonBook(html);
+  if (json) return json;
   if (!html || html.length < 80) return null;
   const out = {};
   const last =
@@ -106,14 +127,6 @@ export function bookHasUsdt(book) {
   return Object.keys(book).some((k) => /^usdt/i.test(k));
 }
 
-/**
- * SUCCESS: HTTP 2xx JSON with accepted>0 (a real observation was written).
- * HIJACKED: HTTP 2xx that is not a legitimate ingest body (HTML, {ok:true}, accepted=0).
- *   accepted=0 on 2xx is NOT a healthy no-op — our API throws 400 when nothing
- *   eligible is written. A 2xx with accepted=0 is the hijacked-onrender signal.
- * AUTH: 401/403.
- * API_FAILURE: any other non-success HTTP.
- */
 export function classifyIngestResponse(status, json, text) {
   const ok = status >= 200 && status < 300;
   const accepted = json != null ? Number(json.accepted) : NaN;
@@ -143,10 +156,15 @@ export function signCollectorPayload(secret, timestamp, payload) {
 
 async function fetchOneBoard(fetchImpl, board, { ua, timeoutMs }) {
   const join = board.includes("?") ? "&" : "?";
+  const jsonish = /bonbast-json|application\/json/.test(board);
   const res = await fetchImpl(`${board}${join}_=${Date.now()}`, {
     cache: "no-store",
     signal: AbortSignal.timeout(timeoutMs),
-    headers: { Accept: "text/html", "Accept-Language": "en-US,en;q=0.9", "User-Agent": ua },
+    headers: {
+      Accept: jsonish ? "application/json, text/html;q=0.8" : "text/html",
+      "Accept-Language": "en-US,en;q=0.9",
+      "User-Agent": ua,
+    },
   });
   if (!res.ok) return { book: null, board, lastBoardErr: `BOARD_HTTP_${res.status}` };
   const html = await res.text();
@@ -155,19 +173,17 @@ async function fetchOneBoard(fetchImpl, board, { ua, timeoutMs }) {
   return { book: null, board, lastBoardErr: "BOARD_EMPTY" };
 }
 
-export async function fetchBoardBook(fetchImpl, boards, { ua = DEFAULT_UA, timeoutMs = 8_000 } = {}) {
-  const results = await Promise.all(
-    boards.map(async (board) => {
-      try {
-        return await fetchOneBoard(fetchImpl, board, { ua, timeoutMs });
-      } catch (e) {
-        return { book: null, board, lastBoardErr: e.message || String(e) };
-      }
-    }),
-  );
-  const hit = results.find((r) => r.book);
-  if (hit) return hit;
-  const errs = results.map((r) => r.lastBoardErr).filter(Boolean);
+export async function fetchBoardBook(fetchImpl, boards, { ua = DEFAULT_UA, timeoutMs = 12_000 } = {}) {
+  const errs = [];
+  for (const board of boards) {
+    try {
+      const hit = await fetchOneBoard(fetchImpl, board, { ua, timeoutMs });
+      if (hit.book) return hit;
+      if (hit.lastBoardErr) errs.push(hit.lastBoardErr);
+    } catch (e) {
+      errs.push(e.message || String(e));
+    }
+  }
   return { book: null, board: null, lastBoardErr: errs[0] || "BOARD_EMPTY" };
 }
 

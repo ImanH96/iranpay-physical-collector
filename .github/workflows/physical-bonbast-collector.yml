@@ -1,11 +1,12 @@
 name: physical-bonbast-collector
-# Public repo: GitHub-hosted minutes are free. This is the live Production
-# collector while P2P-IranPay private-repo hosted runners are billing-locked.
-# Short ticks (DURATION_MS=1). Do not run multi-hour sessions that mask
-# BOARD_HTTP_403 as a green 5h job. Fail the job when no observation is ingested.
+# Fallback ingest only. IranPay API now acquires Bonbast in-process
+# (OTC JSON handshake, then Telegram). This public cron stays as a
+# backup writer of the same BONBAST book. Sequential boards:
+# JSON relay → Telegram → HTML relay → origin last.
+# Fail the job when no observation is ingested (genuine outage).
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 jobs:
   tick:
@@ -24,5 +25,5 @@ jobs:
           IRANPAY_API_BASE: ${{ secrets.IRANPAY_API_BASE }}
           PHYSICAL_COLLECTOR_SECRET: ${{ secrets.PHYSICAL_COLLECTOR_SECRET }}
           COLLECTOR_INTERVAL_MS: "2000"
-          COLLECTOR_DURATION_MS: "25000"
+          COLLECTOR_DURATION_MS: "45000"
         run: node scripts/bonbast-collector.mjs
