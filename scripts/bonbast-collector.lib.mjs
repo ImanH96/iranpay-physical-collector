@@ -1,6 +1,12 @@
 /**
  * Bonbast collector helpers. Keep hijack protection: HTTP 200 without
  * accepted>0 is not success (onrender HTML / {ok:true} must not ingest).
+ *
+ * Board acquisition is tiered and budgeted:
+ *   Tier 1 (hedged): JSON relay + Telegram
+ *   Tier 2: IranPay HTML relay
+ *   Tier 3: bon-bast.com origin (last resort, short timeout)
+ * Ingest POSTs stay sequential. A timed-out POST is ambiguous — no failover.
  */
 import { createHmac } from "node:crypto";
 
@@ -8,6 +14,72 @@ export const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const PHYSICAL = ["usd", "eur", "aed", "cny"];
+
+/** One collectOnce must finish inside the 45s workflow tick with room for one retry. */
+export const COLLECT_ONCE_BUDGET_MS = 28_000;
+export const TIER1_BUDGET_MS = 8_000;
+export const TIER1_PER_SOURCE_MS = 7_000;
+export const TIER2_BUDGET_MS = 6_000;
+export const TIER2_PER_SOURCE_MS = 5_000;
+export const TIER3_BUDGET_MS = 4_000;
+export const TIER3_PER_SOURCE_MS = 3_500;
+export const INGEST_PER_BASE_MS = 8_000;
+export const MIN_ATTEMPT_BUDGET_MS = 12_000;
+export const MAX_COLLECT_ATTEMPTS = 2;
+
+export class CollectorError extends Error {
+  constructor(code, details = {}) {
+    super(formatCollectorError(code, details));
+    this.name = "CollectorError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+export function formatCollectorError(code, details = {}) {
+  const parts = Object.entries(details)
+    .filter(([k, v]) => v != null && v !== "" && k !== "url" && k !== "secret")
+    .map(([k, v]) => `${k}=${v}`);
+  return parts.length ? `${code} ${parts.join(" ")}` : code;
+}
+
+export function isTimeoutError(err) {
+  if (!err) return false;
+  const name = err.name || "";
+  const msg = String(err.message || err);
+  return name === "TimeoutError" || name === "AbortError" || /aborted due to timeout/i.test(msg);
+}
+
+export function classifyBoardUrl(url) {
+  const u = String(url);
+  if (/bonbast-json/i.test(u)) return "json_relay";
+  if (/t\.me\/s\/bonbast/i.test(u)) return "telegram";
+  if (/bonbast-board/i.test(u)) return "html_relay";
+  if (/bon-bast\.com/i.test(u)) return "origin";
+  return "unknown_board";
+}
+
+export function classifyApiBase(url, env = process.env) {
+  const u = String(url).replace(/\/$/, "");
+  if (/iran-pay\.vercel\.app/i.test(u)) return "vercel_api";
+  if (/onrender\.com/i.test(u)) return "render_api";
+  const configured = String(env.IRANPAY_API_BASE || "").replace(/\/$/, "");
+  if (configured && u === configured) return "configured_api";
+  return "unknown_api";
+}
+
+export function remainingMs(deadlineMs, nowMs = Date.now()) {
+  return Math.max(0, deadlineMs - nowMs);
+}
+
+function abortAfter(ms) {
+  if (ms <= 0) {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  }
+  return AbortSignal.timeout(ms);
+}
 
 export function uniqTrim(urls) {
   return urls
@@ -75,6 +147,9 @@ export function extractJsonBook(text) {
     if (!book || typeof book !== "object") return null;
     if (book.usd1 || book.usd2 || book.eur1 || book.aed1 || book.cny1) {
       if (!book._acquisition) book._acquisition = data.acquisition || "json_relay";
+      if (!book.last_update && (data.observedAt || data.receivedAt)) {
+        book.last_update = data.observedAt || data.receivedAt;
+      }
       return book;
     }
   } catch {
@@ -127,6 +202,15 @@ export function bookHasUsdt(book) {
   return Object.keys(book).some((k) => /^usdt/i.test(k));
 }
 
+export function isValidPhysicalBook(book) {
+  if (!book || typeof book !== "object") return false;
+  return PHYSICAL.some((c) => {
+    const sell = String(book[`${c}1`] ?? "");
+    const buy = String(book[`${c}2`] ?? "");
+    return /^\d{3,}$/.test(sell) || /^\d{3,}$/.test(buy);
+  });
+}
+
 export function classifyIngestResponse(status, json, text) {
   const ok = status >= 200 && status < 300;
   const accepted = json != null ? Number(json.accepted) : NaN;
@@ -154,50 +238,173 @@ export function signCollectorPayload(secret, timestamp, payload) {
   return createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
 }
 
-async function fetchOneBoard(fetchImpl, board, { ua, timeoutMs }) {
+async function fetchOneBoard(fetchImpl, board, { ua, timeoutMs, signal }) {
+  const source = classifyBoardUrl(board);
+  const started = Date.now();
   const join = board.includes("?") ? "&" : "?";
-  const jsonish = /bonbast-json|application\/json/.test(board);
-  const res = await fetchImpl(`${board}${join}_=${Date.now()}`, {
-    cache: "no-store",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: {
-      Accept: jsonish ? "application/json, text/html;q=0.8" : "text/html",
-      "Accept-Language": "en-US,en;q=0.9",
-      "User-Agent": ua,
-    },
-  });
-  if (!res.ok) return { book: null, board, lastBoardErr: `BOARD_HTTP_${res.status}` };
-  const html = await res.text();
-  const book = extractBook(html);
-  if (book) return { book, board, lastBoardErr: null };
-  return { book: null, board, lastBoardErr: "BOARD_EMPTY" };
-}
-
-export async function fetchBoardBook(fetchImpl, boards, { ua = DEFAULT_UA, timeoutMs = 12_000 } = {}) {
-  const errs = [];
-  for (const board of boards) {
-    try {
-      const hit = await fetchOneBoard(fetchImpl, board, { ua, timeoutMs });
-      if (hit.book) return hit;
-      if (hit.lastBoardErr) errs.push(hit.lastBoardErr);
-    } catch (e) {
-      errs.push(e.message || String(e));
+  const jsonish = source === "json_relay";
+  const signals = [abortAfter(timeoutMs)];
+  if (signal) signals.push(signal);
+  const combined = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+  try {
+    const res = await fetchImpl(`${board}${join}_=${Date.now()}`, {
+      cache: "no-store",
+      signal: combined,
+      headers: {
+        Accept: jsonish ? "application/json, text/html;q=0.8" : "text/html",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": ua,
+      },
+    });
+    const elapsedMs = Date.now() - started;
+    if (!res.ok) {
+      return {
+        book: null,
+        board,
+        source,
+        elapsedMs,
+        error: new CollectorError("BOARD_HTTP", { source, status: res.status, elapsedMs }),
+      };
     }
+    const html = await res.text();
+    const book = extractBook(html);
+    if (book && isValidPhysicalBook(book)) {
+      return { book, board, source, elapsedMs, error: null };
+    }
+    return {
+      book: null,
+      board,
+      source,
+      elapsedMs,
+      error: new CollectorError("BOARD_EMPTY", { source, elapsedMs }),
+    };
+  } catch (e) {
+    const elapsedMs = Date.now() - started;
+    if (isTimeoutError(e)) {
+      return {
+        book: null,
+        board,
+        source,
+        elapsedMs,
+        error: new CollectorError("BOARD_TIMEOUT", { source, elapsedMs }),
+      };
+    }
+    return {
+      book: null,
+      board,
+      source,
+      elapsedMs,
+      error: new CollectorError("BOARD_ERROR", { source, elapsedMs, reason: e.message || String(e) }),
+    };
   }
-  return { book: null, board: null, lastBoardErr: errs[0] || "BOARD_EMPTY" };
 }
 
-export async function ingestBook(fetchImpl, bases, { secret, book, timeoutMs = 12_000, nowMs = Date.now() }) {
+function boardsForTier(boards, names) {
+  return boards.filter((b) => names.includes(classifyBoardUrl(b)));
+}
+
+async function raceTier(fetchImpl, boards, { ua, perSourceMs, budgetMs, deadlineMs }) {
+  const cancel = new AbortController();
+  const tierCap = Math.min(perSourceMs, budgetMs, remainingMs(deadlineMs));
+  if (tierCap < 200 || boards.length === 0) {
+    return { book: null, errors: [] };
+  }
+  const started = Date.now();
+  const tasks = boards.map((board) =>
+    fetchOneBoard(fetchImpl, board, { ua, timeoutMs: tierCap, signal: cancel.signal }).then((hit) => {
+      if (hit.book) cancel.abort();
+      return hit;
+    }),
+  );
+  const hits = await Promise.all(tasks);
+  const winner = hits.find((h) => h.book);
+  if (winner) return { ...winner, errors: hits.filter((h) => h.error).map((h) => h.error) };
+  return {
+    book: null,
+    errors: hits.map((h) => h.error).filter(Boolean),
+    elapsedMs: Date.now() - started,
+  };
+}
+
+export async function fetchBoardBook(
+  fetchImpl,
+  boards,
+  { ua = DEFAULT_UA, timeoutMs, deadlineMs = Date.now() + COLLECT_ONCE_BUDGET_MS, onEvent } = {},
+) {
+  const emit = (msg) => {
+    if (typeof onEvent === "function") onEvent(msg);
+    else console.log(msg);
+  };
+  const errors = [];
+  const tryTier = async (label, urls, hedge, perSourceMs, budgetMs) => {
+    if (!urls.length) return null;
+    if (remainingMs(deadlineMs) < 200) return null;
+    if (hedge && urls.length > 1) {
+      const raced = await raceTier(fetchImpl, urls, { ua, perSourceMs, budgetMs, deadlineMs });
+      errors.push(...(raced.errors || []));
+      if (raced.book) {
+        emit(`bonbast board ok source=${raced.source} elapsedMs=${raced.elapsedMs}`);
+        return raced;
+      }
+      for (const err of raced.errors || []) emit(`source=${err.details?.source} failed reason=${err.code}`);
+      return null;
+    }
+    for (const board of urls) {
+      if (remainingMs(deadlineMs) < 200) break;
+      const hit = await fetchOneBoard(fetchImpl, board, {
+        ua,
+        timeoutMs: Math.min(perSourceMs, timeoutMs || perSourceMs, remainingMs(deadlineMs)),
+      });
+      if (hit.error) {
+        errors.push(hit.error);
+        emit(`source=${hit.source} failed reason=${hit.error.code}`);
+      }
+      if (hit.book) {
+        emit(`bonbast board ok source=${hit.source} elapsedMs=${hit.elapsedMs}`);
+        return hit;
+      }
+    }
+    return null;
+  };
+
+  const hit =
+    (await tryTier("tier1", boardsForTier(boards, ["json_relay", "telegram"]), true, TIER1_PER_SOURCE_MS, TIER1_BUDGET_MS)) ||
+    (await tryTier("tier2", boardsForTier(boards, ["html_relay"]), false, TIER2_PER_SOURCE_MS, TIER2_BUDGET_MS)) ||
+    (await tryTier("tier3", boardsForTier(boards, ["origin"]), false, TIER3_PER_SOURCE_MS, TIER3_BUDGET_MS));
+
+  if (hit?.book) return hit;
+  const first = errors[0];
+  return {
+    book: null,
+    board: null,
+    source: null,
+    lastBoardErr: first ? first.message : formatCollectorError("BOARD_EMPTY", { source: "all" }),
+    errors,
+  };
+}
+
+export async function ingestBook(
+  fetchImpl,
+  bases,
+  { secret, book, timeoutMs = INGEST_PER_BASE_MS, nowMs = Date.now(), deadlineMs, env = process.env },
+) {
   const fetchedAt = new Date(nowMs).toISOString();
   const payload = JSON.stringify({ provider: "BONBAST", fetchedAt, book });
   const timestamp = String(nowMs);
   const signature = signCollectorPayload(secret, timestamp, payload);
-  let lastErr = "NO_API_BASE";
+  let lastErr = formatCollectorError("INGEST_NO_BASE", {});
   for (const base of bases) {
+    const name = classifyApiBase(base, env);
+    const started = Date.now();
+    const budget = deadlineMs != null ? remainingMs(deadlineMs) : timeoutMs;
+    const wait = Math.min(timeoutMs, budget);
+    if (wait < 50) {
+      throw new CollectorError("INGEST_TIMEOUT", { base: name, elapsedMs: 0, reason: "deadline" });
+    }
     try {
       const ingest = await fetchImpl(`${base}/internal/physical/cash-observations`, {
         method: "POST",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: abortAfter(wait),
         headers: {
           "Content-Type": "application/json",
           "X-IranPay-Timestamp": timestamp,
@@ -205,6 +412,7 @@ export async function ingestBook(fetchImpl, bases, { secret, book, timeoutMs = 1
         },
         body: payload,
       });
+      const elapsedMs = Date.now() - started;
       const text = await ingest.text();
       let json = null;
       try {
@@ -214,31 +422,109 @@ export async function ingestBook(fetchImpl, bases, { secret, book, timeoutMs = 1
       }
       const classified = classifyIngestResponse(ingest.status, json, text);
       if (classified.kind === "success") {
-        return { ok: true, base, classified, fetchedAt, book, lastErr: null };
+        return { ok: true, base, baseName: name, classified, fetchedAt, book, lastErr: null, elapsedMs };
       }
-      lastErr = `INGEST_HTTP_${ingest.status}:${text.slice(0, 180)}`;
+      if (classified.kind === "auth_failure") {
+        throw new CollectorError("INGEST_AUTH_FAILURE", { base: name, status: classified.status, elapsedMs });
+      }
+      lastErr = formatCollectorError("INGEST_HTTP", {
+        base: name,
+        status: ingest.status,
+        elapsedMs,
+        kind: classified.kind,
+      });
+      // Clear HTTP/hijack on this host: try the next sequential base only.
     } catch (e) {
-      lastErr = e.message || String(e);
+      const elapsedMs = Date.now() - started;
+      if (e instanceof CollectorError) throw e;
+      if (isTimeoutError(e)) {
+        // Request may have been processed. Do not POST the same observation again.
+        throw new CollectorError("INGEST_TIMEOUT", { base: name, elapsedMs });
+      }
+      lastErr = formatCollectorError("INGEST_ERROR", { base: name, elapsedMs, reason: e.message || String(e) });
     }
   }
   return { ok: false, base: null, classified: null, fetchedAt, book, lastErr };
 }
 
-export async function collectOnce({ fetchImpl, env = process.env, nowMs = Date.now() } = {}) {
+export async function collectOnce({
+  fetchImpl,
+  env = process.env,
+  nowMs = Date.now(),
+  deadlineMs,
+  onEvent,
+} = {}) {
   const secret = String(env.PHYSICAL_COLLECTOR_SECRET || "").trim();
   if (!secret) throw new Error("PHYSICAL_COLLECTOR_SECRET missing");
   const fetchFn = fetchImpl || fetch;
   const boards = boardUrls(env);
   const bases = apiBases(env);
-  const fetched = await fetchBoardBook(fetchFn, boards);
+  const hardDeadline = deadlineMs ?? nowMs + COLLECT_ONCE_BUDGET_MS;
+  const fetched = await fetchBoardBook(fetchFn, boards, { deadlineMs: hardDeadline, onEvent });
   if (!fetched.book) throw new Error(fetched.lastBoardErr);
-  const ingested = await ingestBook(fetchFn, bases, { secret, book: fetched.book, nowMs });
+  const ingested = await ingestBook(fetchFn, bases, {
+    secret,
+    book: fetched.book,
+    nowMs,
+    deadlineMs: hardDeadline,
+    env,
+  });
   if (!ingested.ok) throw new Error(ingested.lastErr);
+  const emit = (msg) => {
+    if (typeof onEvent === "function") onEvent(msg);
+    else console.log(msg);
+  };
+  emit(`bonbast ingest ok base=${ingested.baseName} accepted=${ingested.classified.accepted}`);
   return {
     fetchedAt: ingested.fetchedAt,
     base: ingested.base,
+    baseName: ingested.baseName,
     board: fetched.board,
+    source: fetched.source,
     book: fetched.book,
     accepted: ingested.classified.accepted,
   };
+}
+
+export async function runCollectorLoop({
+  collect = collectOnce,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  durationMs,
+  intervalMs,
+  maxAttempts = MAX_COLLECT_ATTEMPTS,
+  minAttemptBudgetMs = MIN_ATTEMPT_BUDGET_MS,
+  collectOnceBudgetMs = COLLECT_ONCE_BUDGET_MS,
+  log = console,
+} = {}) {
+  const started = now();
+  let okCount = 0;
+  let lastError = null;
+  let attempts = 0;
+  let lastResult = null;
+  while (true) {
+    const remaining = durationMs - (now() - started);
+    if (okCount > 0) break;
+    if (attempts >= maxAttempts) break;
+    const need = attempts === 0 ? minAttemptBudgetMs : collectOnceBudgetMs;
+    if (remaining < need) break;
+    attempts += 1;
+    const deadlineMs = now() + Math.min(collectOnceBudgetMs, Math.max(0, remaining - 250));
+    try {
+      lastResult = await collect({ deadlineMs });
+      okCount += 1;
+      lastError = null;
+      log.log(
+        `bonbast ingest ok ${lastResult.fetchedAt} via=${lastResult.baseName ?? lastResult.base} source=${lastResult.source ?? "?"} last=${lastResult.book?.last_update ?? "?"} usd=${lastResult.book?.usd1}/${lastResult.book?.usd2} accepted=${lastResult.accepted}`,
+      );
+      break;
+    } catch (e) {
+      lastError = e;
+      log.error(`bonbast tick failed: ${e.message}`);
+    }
+    const rem = durationMs - (now() - started);
+    if (okCount > 0 || rem < minAttemptBudgetMs || attempts >= maxAttempts) break;
+    await sleep(Math.min(intervalMs, Math.max(0, rem - minAttemptBudgetMs)));
+  }
+  return { okCount, lastError, attempts, lastResult };
 }

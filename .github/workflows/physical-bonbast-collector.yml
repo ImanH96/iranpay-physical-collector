@@ -1,9 +1,9 @@
 name: physical-bonbast-collector
 # Fallback ingest only. IranPay API now acquires Bonbast in-process
 # (OTC JSON handshake, then Telegram). This public cron stays as a
-# backup writer of the same BONBAST book. Sequential boards:
-# JSON relay → Telegram → HTML relay → origin last.
-# Fail the job when no observation is ingested (genuine outage).
+# backup writer of the same BONBAST book.
+# Tier 1 hedged: JSON relay + Telegram. Tier 2: HTML relay. Tier 3: origin last.
+# One confirmed ingest (accepted>0) ends the tick. Fail closed on data loss.
 on:
   schedule:
     - cron: "*/15 * * * *"
