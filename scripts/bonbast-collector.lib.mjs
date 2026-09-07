@@ -6,7 +6,8 @@
  *   Tier 1 (hedged): JSON relay + Telegram
  *   Tier 2: IranPay HTML relay
  *   Tier 3: bon-bast.com origin (last resort, short timeout)
- * Ingest POSTs stay sequential. A timed-out POST is ambiguous — no failover.
+ * Ingest: GET /health (read-only wake, hedged) then one sequential POST.
+ * A timed-out POST is ambiguous — no failover POST of the same payload.
  */
 import { createHmac } from "node:crypto";
 
@@ -15,15 +16,18 @@ export const DEFAULT_UA =
 
 const PHYSICAL = ["usd", "eur", "aed", "cny"];
 
-/** One collectOnce must finish inside the 45s workflow tick with room for one retry. */
-export const COLLECT_ONCE_BUDGET_MS = 28_000;
+/** Board + wake + one POST must fit inside the 45s workflow tick. */
+export const COLLECT_ONCE_BUDGET_MS = 38_000;
 export const TIER1_BUDGET_MS = 8_000;
 export const TIER1_PER_SOURCE_MS = 7_000;
 export const TIER2_BUDGET_MS = 6_000;
 export const TIER2_PER_SOURCE_MS = 5_000;
 export const TIER3_BUDGET_MS = 4_000;
 export const TIER3_PER_SOURCE_MS = 3_500;
-export const INGEST_PER_BASE_MS = 8_000;
+/** Confirmed write window after the ingest host has answered /health. */
+export const INGEST_POST_MS = 8_000;
+export const INGEST_PER_BASE_MS = INGEST_POST_MS;
+export const WAKE_PER_HOST_MS = 20_000;
 export const MIN_ATTEMPT_BUDGET_MS = 12_000;
 export const MAX_COLLECT_ATTEMPTS = 2;
 
@@ -383,6 +387,98 @@ export async function fetchBoardBook(
   };
 }
 
+function preferRenderFirst(bases, env) {
+  const unique = uniqTrim(bases);
+  return [
+    ...unique.filter((b) => classifyApiBase(b, env) === "render_api"),
+    ...unique.filter((b) => classifyApiBase(b, env) !== "render_api"),
+  ];
+}
+
+export async function wakeIngestHost(
+  fetchImpl,
+  bases,
+  { deadlineMs = Date.now() + WAKE_PER_HOST_MS, timeoutMs = WAKE_PER_HOST_MS, onEvent, env = process.env } = {},
+) {
+  const emit = (msg) => {
+    if (typeof onEvent === "function") onEvent(msg);
+    else console.log(msg);
+  };
+  const ordered = preferRenderFirst(bases, env);
+  if (!ordered.length) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "no_base" });
+  const budget = Math.min(timeoutMs, remainingMs(deadlineMs));
+  if (budget < 200) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "deadline" });
+
+  const cancel = new AbortController();
+  const tasks = ordered.map(async (base) => {
+    const name = classifyApiBase(base, env);
+    const started = Date.now();
+    try {
+      const res = await fetchImpl(`${base}/health?_=${Date.now()}`, {
+        method: "GET",
+        cache: "no-store",
+        signal: AbortSignal.any([abortAfter(budget), cancel.signal]),
+        headers: { Accept: "application/json" },
+      });
+      const elapsedMs = Date.now() - started;
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs }),
+        };
+      }
+      const text = await res.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      if (json && typeof json === "object" && json.ok === false) {
+        return {
+          ok: false,
+          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs }),
+        };
+      }
+      if (text && /<html/i.test(text) && !text.trim().startsWith("{")) {
+        return {
+          ok: false,
+          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs, kind: "hijacked_or_invalid" }),
+        };
+      }
+      return { ok: true, base, baseName: name, elapsedMs, error: null };
+    } catch (e) {
+      const elapsedMs = Date.now() - started;
+      if (cancel.signal.aborted && !/timeout/i.test(String(e.message || e))) {
+        return { ok: false, error: null };
+      }
+      if (isTimeoutError(e)) {
+        return { ok: false, error: new CollectorError("INGEST_WAKE_TIMEOUT", { base: name, elapsedMs }) };
+      }
+      return {
+        ok: false,
+        error: new CollectorError("INGEST_WAKE_ERROR", { base: name, elapsedMs, reason: e.message || String(e) }),
+      };
+    }
+  });
+
+  const hits = await Promise.all(
+    tasks.map((p) =>
+      p.then((hit) => {
+        if (hit.ok) cancel.abort();
+        return hit;
+      }),
+    ),
+  );
+  const winner = hits.find((h) => h.ok);
+  if (winner) {
+    emit(`bonbast ingest wake ok base=${winner.baseName} elapsedMs=${winner.elapsedMs}`);
+    return winner;
+  }
+  const firstErr = hits.map((h) => h.error).find(Boolean);
+  throw firstErr || new CollectorError("INGEST_UNAVAILABLE", { reason: "wake_failed" });
+}
+
 export async function ingestBook(
   fetchImpl,
   bases,
@@ -462,19 +558,34 @@ export async function collectOnce({
   const hardDeadline = deadlineMs ?? nowMs + COLLECT_ONCE_BUDGET_MS;
   const fetched = await fetchBoardBook(fetchFn, boards, { deadlineMs: hardDeadline, onEvent });
   if (!fetched.book) throw new Error(fetched.lastBoardErr);
-  const ingested = await ingestBook(fetchFn, bases, {
-    secret,
-    book: fetched.book,
-    nowMs,
-    deadlineMs: hardDeadline,
-    env,
-  });
-  if (!ingested.ok) throw new Error(ingested.lastErr);
   const emit = (msg) => {
     if (typeof onEvent === "function") onEvent(msg);
     else console.log(msg);
   };
-  emit(`bonbast ingest ok base=${ingested.baseName} accepted=${ingested.classified.accepted}`);
+  let ingestBases = bases;
+  const rem = remainingMs(hardDeadline);
+  const postWait = Math.min(INGEST_POST_MS, Math.max(0, rem - 250));
+  const wakeWait = Math.max(0, rem - postWait - 250);
+  if (wakeWait >= 400) {
+    const woke = await wakeIngestHost(fetchFn, bases, {
+      deadlineMs: Date.now() + wakeWait,
+      timeoutMs: wakeWait,
+      onEvent,
+      env,
+    });
+    ingestBases = uniqTrim([woke.base, ...bases]);
+  }
+  emit(`bonbast ingest start base=${classifyApiBase(ingestBases[0], env)} timeoutMs=${postWait}`);
+  const ingested = await ingestBook(fetchFn, ingestBases, {
+    secret,
+    book: fetched.book,
+    nowMs,
+    timeoutMs: postWait,
+    deadlineMs: hardDeadline,
+    env,
+  });
+  if (!ingested.ok) throw new Error(ingested.lastErr);
+  emit(`bonbast ingest ok base=${ingested.baseName} accepted=${ingested.classified.accepted} elapsedMs=${ingested.elapsedMs}`);
   return {
     fetchedAt: ingested.fetchedAt,
     base: ingested.base,

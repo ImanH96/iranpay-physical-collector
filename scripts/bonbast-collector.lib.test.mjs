@@ -19,6 +19,7 @@ import {
   physicalCurrenciesOnly,
   remainingMs,
   runCollectorLoop,
+  wakeIngestHost,
   COLLECT_ONCE_BUDGET_MS,
   MIN_ATTEMPT_BUDGET_MS,
 } from "./bonbast-collector.lib.mjs";
@@ -102,8 +103,17 @@ function ingestOk(accepted = 4) {
   };
 }
 
-function boardFetch(map, { ingest = ingestOk } = {}) {
+function healthOk() {
+  return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, gitSha: "test" }) };
+}
+
+function boardFetch(map, { ingest = ingestOk, health } = {}) {
   return async (url, init) => {
+    if (String(url).includes("/health")) {
+      if (health) return health(url, init);
+      if (map.health) return map.health(url, init);
+      return healthOk();
+    }
     if (init?.method === "POST") return ingest(url, init);
     if (String(url).includes("bonbast-json")) return map.json ? map.json(init) : { ok: false, status: 599, text: async () => "" };
     if (String(url).includes("t.me")) return map.telegram ? map.telegram(init) : { ok: false, status: 599, text: async () => "" };
@@ -468,6 +478,63 @@ test("fail-closed: ingest unavailable", async () => {
         ),
       }),
     (e) => /INGEST_HTTP/.test(e.message) && /status=503/.test(e.message),
+  );
+});
+
+test("wake GET then a single sequential POST", async () => {
+  const calls = [];
+  const r = await collectOnce({
+    env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+    onEvent: () => {},
+    fetchImpl: async (url, init) => {
+      calls.push({ method: init?.method || "GET", url: String(url) });
+      if (String(url).includes("/health")) return healthOk();
+      if (init?.method === "POST") return ingestOk(4);
+      if (String(url).includes("bonbast-json")) return jsonRelayOk();
+      return { ok: false, status: 404, text: async () => "" };
+    },
+  });
+  assert.equal(r.accepted, 4);
+  const posts = calls.filter((c) => c.method === "POST");
+  const wakes = calls.filter((c) => String(c.url).includes("/health"));
+  assert.ok(wakes.length >= 1, "expected a health wake");
+  assert.equal(posts.length, 1);
+  assert.ok(calls.findIndex((c) => String(c.url).includes("/health")) < calls.findIndex((c) => c.method === "POST"));
+});
+
+test("wake timeout does not POST", async () => {
+  let posts = 0;
+  await assert.rejects(
+    () =>
+      collectOnce({
+        env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+        deadlineMs: Date.now() + 12_000,
+        onEvent: () => {},
+        fetchImpl: boardFetch(
+          { json: jsonRelayOk },
+          {
+            health: (url, init) => hangingFetch(init?.signal, 20_000),
+            ingest: async () => {
+              posts += 1;
+              return ingestOk(4);
+            },
+          },
+        ),
+      }),
+    (e) => /INGEST_WAKE_TIMEOUT|INGEST_UNAVAILABLE/.test(e.message),
+  );
+  assert.equal(posts, 0);
+});
+
+test("wake timeout identifies API base", async () => {
+  await assert.rejects(
+    () =>
+      wakeIngestHost(async (_url, init) => hangingFetch(init?.signal, 20_000), ["https://iranpay-api.onrender.com/api/v1"], {
+        timeoutMs: 250,
+        deadlineMs: Date.now() + 400,
+        onEvent: () => {},
+      }),
+    (e) => e instanceof CollectorError && e.code === "INGEST_WAKE_TIMEOUT" && e.details.base === "render_api",
   );
 });
 
