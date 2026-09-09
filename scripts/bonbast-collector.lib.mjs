@@ -6,8 +6,9 @@
  *   Tier 1 (hedged): JSON relay + Telegram
  *   Tier 2: IranPay HTML relay
  *   Tier 3: bon-bast.com origin (last resort, short timeout)
- * Ingest: GET /health (read-only wake, hedged) then one sequential POST.
- * A timed-out POST is ambiguous — no failover POST of the same payload.
+ * Ingest: overlapping read-only GET /health probes (Render wake) + board
+ * fetch, then exactly one sequential POST. A timed-out POST is ambiguous —
+ * no failover POST of the same payload. Wake probes may retry; POST may not.
  */
 import { createHmac } from "node:crypto";
 
@@ -27,7 +28,15 @@ export const TIER3_PER_SOURCE_MS = 3_500;
 /** Confirmed write window after the ingest host has answered /health. */
 export const INGEST_POST_MS = 8_000;
 export const INGEST_PER_BASE_MS = INGEST_POST_MS;
+/** Upper bound for the whole wake phase (short probes, not one hang). */
 export const WAKE_PER_HOST_MS = 20_000;
+/**
+ * Observed: warm /health 160–202ms; cold single GET hung ~28900ms then aborted.
+ * Short probes open a new connection after Render starts accepting.
+ */
+export const WAKE_PROBE_BUDGETS_MS = [2_500, 4_000, 6_000, 8_000];
+export const WAKE_PROBE_GAP_MS = 300;
+export const MAX_WAKE_PROBES = 5;
 export const MIN_ATTEMPT_BUDGET_MS = 12_000;
 export const MAX_COLLECT_ATTEMPTS = 2;
 
@@ -76,13 +85,19 @@ export function remainingMs(deadlineMs, nowMs = Date.now()) {
   return Math.max(0, deadlineMs - nowMs);
 }
 
-function abortAfter(ms) {
+function abortAfter(ms, extra) {
   if (ms <= 0) {
     const c = new AbortController();
     c.abort();
-    return c.signal;
+    return extra ? AbortSignal.any([c.signal, extra]) : c.signal;
   }
-  return AbortSignal.timeout(ms);
+  const timeout = AbortSignal.timeout(ms);
+  return extra ? AbortSignal.any([timeout, extra]) : timeout;
+}
+
+export function nextWakeProbeMs(index, remainingMsBudget) {
+  const planned = WAKE_PROBE_BUDGETS_MS[Math.min(index, WAKE_PROBE_BUDGETS_MS.length - 1)];
+  return Math.min(planned, remainingMsBudget);
 }
 
 export function uniqTrim(urls) {
@@ -224,7 +239,7 @@ export function classifyIngestResponse(status, json, text) {
   if (ok) {
     return {
       kind: "hijacked_or_invalid",
-      accepted: Number.isFinite(accepted) ? accepted : 0,
+      accepted: Number.isFinite(accepted) ? accepted : null,
       snippet: String(text ?? "").slice(0, 180),
     };
   }
@@ -395,88 +410,126 @@ function preferRenderFirst(bases, env) {
   ];
 }
 
+async function probeWakeOnce(fetchImpl, base, { timeoutMs, cancelSignal, env }) {
+  const name = classifyApiBase(base, env);
+  const started = Date.now();
+  try {
+    const res = await fetchImpl(`${base}/health?_=${Date.now()}`, {
+      method: "GET",
+      cache: "no-store",
+      signal: abortAfter(timeoutMs, cancelSignal),
+      headers: { Accept: "application/json" },
+    });
+    const elapsedMs = Date.now() - started;
+    if (!res.ok) {
+      return {
+        ok: false,
+        error: new CollectorError("INGEST_WAKE_HTTP_ERROR", { base: name, status: res.status, elapsedMs }),
+      };
+    }
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    if (json && typeof json === "object" && json.ok === false) {
+      return {
+        ok: false,
+        error: new CollectorError("INGEST_WAKE_HTTP_ERROR", { base: name, status: res.status, elapsedMs }),
+      };
+    }
+    if (text && /<html/i.test(text) && !text.trim().startsWith("{")) {
+      return {
+        ok: false,
+        error: new CollectorError("INGEST_WAKE_HTTP_ERROR", {
+          base: name,
+          status: res.status,
+          elapsedMs,
+          kind: "hijacked_or_invalid",
+        }),
+      };
+    }
+    return { ok: true, base, baseName: name, elapsedMs, error: null };
+  } catch (e) {
+    const elapsedMs = Date.now() - started;
+    if (cancelSignal?.aborted && !isTimeoutError(e)) {
+      return { ok: false, cancelled: true, error: null };
+    }
+    if (isTimeoutError(e)) {
+      return { ok: false, error: new CollectorError("INGEST_WAKE_TIMEOUT", { base: name, elapsedMs }) };
+    }
+    return {
+      ok: false,
+      error: new CollectorError("INGEST_WAKE_ERROR", { base: name, elapsedMs, reason: e.message || String(e) }),
+    };
+  }
+}
+
 export async function wakeIngestHost(
   fetchImpl,
   bases,
-  { deadlineMs = Date.now() + WAKE_PER_HOST_MS, timeoutMs = WAKE_PER_HOST_MS, onEvent, env = process.env } = {},
+  {
+    deadlineMs = Date.now() + WAKE_PER_HOST_MS,
+    timeoutMs = WAKE_PER_HOST_MS,
+    onEvent,
+    env = process.env,
+    cancelSignal,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  } = {},
 ) {
   const emit = (msg) => {
     if (typeof onEvent === "function") onEvent(msg);
     else console.log(msg);
   };
   const ordered = preferRenderFirst(bases, env);
-  if (!ordered.length) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "no_base" });
-  const budget = Math.min(timeoutMs, remainingMs(deadlineMs));
-  if (budget < 200) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "deadline" });
+  const primary =
+    ordered.find((b) => classifyApiBase(b, env) === "render_api") || ordered[0];
+  if (!primary) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "no_base" });
+  const name = classifyApiBase(primary, env);
+  const phaseStarted = Date.now();
+  let lastErr = null;
+  let probeCount = 0;
+  const phaseBudget = Math.min(timeoutMs, remainingMs(deadlineMs));
+  if (phaseBudget < 200) throw new CollectorError("INGEST_UNAVAILABLE", { reason: "deadline" });
 
-  const cancel = new AbortController();
-  const tasks = ordered.map(async (base) => {
-    const name = classifyApiBase(base, env);
-    const started = Date.now();
-    try {
-      const res = await fetchImpl(`${base}/health?_=${Date.now()}`, {
-        method: "GET",
-        cache: "no-store",
-        signal: AbortSignal.any([abortAfter(budget), cancel.signal]),
-        headers: { Accept: "application/json" },
-      });
-      const elapsedMs = Date.now() - started;
-      if (!res.ok) {
-        return {
-          ok: false,
-          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs }),
-        };
-      }
-      const text = await res.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        json = null;
-      }
-      if (json && typeof json === "object" && json.ok === false) {
-        return {
-          ok: false,
-          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs }),
-        };
-      }
-      if (text && /<html/i.test(text) && !text.trim().startsWith("{")) {
-        return {
-          ok: false,
-          error: new CollectorError("INGEST_WAKE_HTTP", { base: name, status: res.status, elapsedMs, kind: "hijacked_or_invalid" }),
-        };
-      }
-      return { ok: true, base, baseName: name, elapsedMs, error: null };
-    } catch (e) {
-      const elapsedMs = Date.now() - started;
-      if (cancel.signal.aborted && !/timeout/i.test(String(e.message || e))) {
-        return { ok: false, error: null };
-      }
-      if (isTimeoutError(e)) {
-        return { ok: false, error: new CollectorError("INGEST_WAKE_TIMEOUT", { base: name, elapsedMs }) };
-      }
-      return {
-        ok: false,
-        error: new CollectorError("INGEST_WAKE_ERROR", { base: name, elapsedMs, reason: e.message || String(e) }),
-      };
+  while (probeCount < MAX_WAKE_PROBES) {
+    if (cancelSignal?.aborted) {
+      throw lastErr || new CollectorError("INGEST_UNAVAILABLE", { reason: "wake_cancelled" });
     }
-  });
-
-  const hits = await Promise.all(
-    tasks.map((p) =>
-      p.then((hit) => {
-        if (hit.ok) cancel.abort();
-        return hit;
-      }),
-    ),
-  );
-  const winner = hits.find((h) => h.ok);
-  if (winner) {
-    emit(`bonbast ingest wake ok base=${winner.baseName} elapsedMs=${winner.elapsedMs}`);
-    return winner;
+    const rem = Math.min(phaseBudget - (Date.now() - phaseStarted), remainingMs(deadlineMs));
+    if (rem < 200) break;
+    const probeMs = nextWakeProbeMs(probeCount, rem);
+    if (probeMs < 200) break;
+    probeCount += 1;
+    const hit = await probeWakeOnce(fetchImpl, primary, {
+      timeoutMs: probeMs,
+      cancelSignal,
+      env,
+    });
+    if (hit.cancelled) {
+      throw lastErr || new CollectorError("INGEST_UNAVAILABLE", { reason: "wake_cancelled" });
+    }
+    if (hit.ok) {
+      const elapsedMs = Date.now() - phaseStarted;
+      emit(`bonbast ingest wake ok base=${hit.baseName} probes=${probeCount} elapsedMs=${elapsedMs}`);
+      return { ...hit, probeCount, elapsedMs };
+    }
+    lastErr = hit.error;
+    const afterProbe = Math.min(phaseBudget - (Date.now() - phaseStarted), remainingMs(deadlineMs));
+    if (probeCount >= MAX_WAKE_PROBES || afterProbe < 200) break;
+    const gap = Math.min(WAKE_PROBE_GAP_MS, afterProbe - 200);
+    if (gap > 0) await sleep(gap);
   }
-  const firstErr = hits.map((h) => h.error).find(Boolean);
-  throw firstErr || new CollectorError("INGEST_UNAVAILABLE", { reason: "wake_failed" });
+  const elapsedMs = Date.now() - phaseStarted;
+  const err =
+    lastErr ||
+    new CollectorError("INGEST_WAKE_TIMEOUT", { base: name, elapsedMs, probes: probeCount });
+  if (err instanceof CollectorError) {
+    err.details = { ...err.details, probes: probeCount, elapsedMs };
+  }
+  throw err;
 }
 
 export async function ingestBook(
@@ -495,7 +548,7 @@ export async function ingestBook(
     const budget = deadlineMs != null ? remainingMs(deadlineMs) : timeoutMs;
     const wait = Math.min(timeoutMs, budget);
     if (wait < 50) {
-      throw new CollectorError("INGEST_TIMEOUT", { base: name, elapsedMs: 0, reason: "deadline" });
+      throw new CollectorError("INGEST_POST_TIMEOUT_AMBIGUOUS", { base: name, elapsedMs: 0, reason: "deadline" });
     }
     try {
       const ingest = await fetchImpl(`${base}/internal/physical/cash-observations`, {
@@ -523,19 +576,23 @@ export async function ingestBook(
       if (classified.kind === "auth_failure") {
         throw new CollectorError("INGEST_AUTH_FAILURE", { base: name, status: classified.status, elapsedMs });
       }
-      lastErr = formatCollectorError("INGEST_HTTP", {
+      if (classified.kind === "hijacked_or_invalid") {
+        const code = classified.accepted === 0 ? "INGEST_ACCEPTED_ZERO" : "INGEST_POST_REJECTED";
+        throw new CollectorError(code, { base: name, elapsedMs, kind: classified.kind });
+      }
+      lastErr = formatCollectorError("INGEST_POST_REJECTED", {
         base: name,
         status: ingest.status,
         elapsedMs,
         kind: classified.kind,
       });
-      // Clear HTTP/hijack on this host: try the next sequential base only.
+      // Clear HTTP reject on this host: try the next sequential base only. Never after an ambiguous POST.
     } catch (e) {
       const elapsedMs = Date.now() - started;
       if (e instanceof CollectorError) throw e;
       if (isTimeoutError(e)) {
         // Request may have been processed. Do not POST the same observation again.
-        throw new CollectorError("INGEST_TIMEOUT", { base: name, elapsedMs });
+        throw new CollectorError("INGEST_POST_TIMEOUT_AMBIGUOUS", { base: name, elapsedMs });
       }
       lastErr = formatCollectorError("INGEST_ERROR", { base: name, elapsedMs, reason: e.message || String(e) });
     }
@@ -556,26 +613,52 @@ export async function collectOnce({
   const boards = boardUrls(env);
   const bases = apiBases(env);
   const hardDeadline = deadlineMs ?? nowMs + COLLECT_ONCE_BUDGET_MS;
-  const fetched = await fetchBoardBook(fetchFn, boards, { deadlineMs: hardDeadline, onEvent });
-  if (!fetched.book) throw new Error(fetched.lastBoardErr);
   const emit = (msg) => {
     if (typeof onEvent === "function") onEvent(msg);
     else console.log(msg);
   };
-  let ingestBases = bases;
-  const rem = remainingMs(hardDeadline);
-  const postWait = Math.min(INGEST_POST_MS, Math.max(0, rem - 250));
-  const wakeWait = Math.max(0, rem - postWait - 250);
-  if (wakeWait >= 400) {
-    const woke = await wakeIngestHost(fetchFn, bases, {
-      deadlineMs: Date.now() + wakeWait,
-      timeoutMs: wakeWait,
-      onEvent,
-      env,
-    });
-    ingestBases = uniqTrim([woke.base, ...bases]);
+  const remAtStart = remainingMs(hardDeadline);
+  const postReserve = Math.min(INGEST_POST_MS, Math.max(0, remAtStart - 250));
+  const wakeBudget = Math.max(0, remAtStart - postReserve - 250);
+  const cancelWake = new AbortController();
+  const wakePromise =
+    wakeBudget >= 400
+      ? wakeIngestHost(fetchFn, bases, {
+          deadlineMs: Date.now() + wakeBudget,
+          timeoutMs: wakeBudget,
+          onEvent,
+          env,
+          cancelSignal: cancelWake.signal,
+        }).catch((err) => err)
+      : Promise.resolve(null);
+
+  let fetched;
+  try {
+    fetched = await fetchBoardBook(fetchFn, boards, { deadlineMs: hardDeadline, onEvent });
+  } catch (e) {
+    cancelWake.abort();
+    throw e;
   }
-  emit(`bonbast ingest start base=${classifyApiBase(ingestBases[0], env)} timeoutMs=${postWait}`);
+  if (!fetched.book) {
+    cancelWake.abort();
+    throw new Error(fetched.lastBoardErr);
+  }
+
+  const woke = await wakePromise;
+  if (woke instanceof Error) throw woke;
+  if (!woke?.base) {
+    throw new CollectorError("INGEST_WAKE_TIMEOUT", {
+      reason: wakeBudget < 400 ? "no_wake_budget" : "wake_incomplete",
+      elapsedMs: 0,
+      probes: 0,
+    });
+  }
+  let ingestBases = bases;
+  if (woke?.base) ingestBases = uniqTrim([woke.base, ...bases]);
+  const postWait = Math.min(INGEST_POST_MS, Math.max(0, remainingMs(hardDeadline) - 250));
+  emit(
+    `bonbast ingest start base=${classifyApiBase(ingestBases[0], env)} timeoutMs=${postWait} wakeProbes=${woke?.probeCount ?? 0}`,
+  );
   const ingested = await ingestBook(fetchFn, ingestBases, {
     secret,
     book: fetched.book,
@@ -594,6 +677,10 @@ export async function collectOnce({
     source: fetched.source,
     book: fetched.book,
     accepted: ingested.classified.accepted,
+    wakeProbes: woke?.probeCount ?? 0,
+    wakeElapsedMs: woke?.elapsedMs ?? 0,
+    boardElapsedMs: fetched.elapsedMs ?? null,
+    postElapsedMs: ingested.elapsedMs ?? null,
   };
 }
 
@@ -626,7 +713,7 @@ export async function runCollectorLoop({
       okCount += 1;
       lastError = null;
       log.log(
-        `bonbast ingest ok ${lastResult.fetchedAt} via=${lastResult.baseName ?? lastResult.base} source=${lastResult.source ?? "?"} last=${lastResult.book?.last_update ?? "?"} usd=${lastResult.book?.usd1}/${lastResult.book?.usd2} accepted=${lastResult.accepted}`,
+        `bonbast ingest ok ${lastResult.fetchedAt} via=${lastResult.baseName ?? lastResult.base} last=${lastResult.book?.last_update ?? "?"} usd=${lastResult.book?.usd1}/${lastResult.book?.usd2} wake probes=${lastResult.wakeProbes ?? "?"} elapsedMs=${lastResult.wakeElapsedMs ?? "?"} board source=${lastResult.source ?? "?"} elapsedMs=${lastResult.boardElapsedMs ?? "?"} ingest accepted=${lastResult.accepted} elapsedMs=${lastResult.postElapsedMs ?? "?"}`,
       );
       break;
     } catch (e) {

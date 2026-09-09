@@ -20,8 +20,11 @@ import {
   remainingMs,
   runCollectorLoop,
   wakeIngestHost,
+  nextWakeProbeMs,
   COLLECT_ONCE_BUDGET_MS,
   MIN_ATTEMPT_BUDGET_MS,
+  MAX_WAKE_PROBES,
+  WAKE_PROBE_BUDGETS_MS,
 } from "./bonbast-collector.lib.mjs";
 
 const BOARD_HTML = `
@@ -157,8 +160,10 @@ test("JSON relay HTTP success without book is not a valid book", () => {
 test("ingest SUCCESS requires accepted>0", () => {
   assert.equal(classifyIngestResponse(200, { accepted: 4 }, '{"accepted":4}').kind, "success");
   assert.equal(classifyIngestResponse(200, { accepted: 0 }, '{"accepted":0}').kind, "hijacked_or_invalid");
+  assert.equal(classifyIngestResponse(200, { accepted: 0 }, '{"accepted":0}').accepted, 0);
   assert.equal(classifyIngestResponse(200, { ok: true }, '{"ok":true}').kind, "hijacked_or_invalid");
   assert.equal(classifyIngestResponse(200, null, "<html>onrender</html>").kind, "hijacked_or_invalid");
+  assert.equal(classifyIngestResponse(200, null, "<html>onrender</html>").accepted, null);
 });
 
 test("process exits 1 when no successful ingest", () => {
@@ -407,7 +412,8 @@ test("ingest timeout identifies API base and does not failover", async () => {
         apiBases({}),
         { secret: SECRET, book: { usd1: "199000", usd2: "198900" }, timeoutMs: 80, nowMs: 1 },
       ),
-    (e) => e instanceof CollectorError && e.code === "INGEST_TIMEOUT" && e.details.base === "vercel_api",
+    (e) =>
+      e instanceof CollectorError && e.code === "INGEST_POST_TIMEOUT_AMBIGUOUS" && e.details.base === "vercel_api",
   );
   assert.equal(posts, 1);
 });
@@ -447,7 +453,7 @@ test("fail-closed: 200 + accepted=0 is failure", async () => {
           { ingest: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ accepted: 0 }) }) },
         ),
       }),
-    (e) => /INGEST_HTTP/.test(e.message) && /kind=hijacked_or_invalid/.test(e.message),
+    (e) => /INGEST_ACCEPTED_ZERO/.test(e.message),
   );
 });
 
@@ -462,7 +468,7 @@ test("fail-closed: 200 HTML ingest is failure", async () => {
           { ingest: async () => ({ ok: true, status: 200, text: async () => "<html>Render</html>" }) },
         ),
       }),
-    (e) => /INGEST_HTTP/.test(e.message),
+    (e) => /INGEST_POST_REJECTED/.test(e.message),
   );
 });
 
@@ -477,7 +483,7 @@ test("fail-closed: ingest unavailable", async () => {
           { ingest: async () => ({ ok: false, status: 503, text: async () => "down" }) },
         ),
       }),
-    (e) => /INGEST_HTTP/.test(e.message) && /status=503/.test(e.message),
+    (e) => /INGEST_POST_REJECTED/.test(e.message) && /status=503/.test(e.message),
   );
 });
 
@@ -538,6 +544,19 @@ test("wake timeout identifies API base", async () => {
   );
 });
 
+test("wake HTTP error is distinct from POST timeout", async () => {
+  await assert.rejects(
+    () =>
+      wakeIngestHost(async () => ({ ok: false, status: 503, text: async () => "cold" }), ["https://iranpay-api.onrender.com/api/v1"], {
+        timeoutMs: 400,
+        deadlineMs: Date.now() + 500,
+        onEvent: () => {},
+        sleep: async () => {},
+      }),
+    (e) => e instanceof CollectorError && e.code === "INGEST_WAKE_HTTP_ERROR" && /status=503/.test(e.message),
+  );
+});
+
 test("ingest POSTs remain sequential", async () => {
   const inflight = { n: 0, max: 0 };
   await ingestBook(
@@ -562,4 +581,164 @@ test("ingest POSTs remain sequential", async () => {
 test("remainingMs never goes negative", () => {
   assert.equal(remainingMs(10, 20), 0);
   assert.ok(remainingMs(Date.now() + 1000) > 0);
+});
+
+test("wake probe schedule is short and bounded", () => {
+  assert.equal(nextWakeProbeMs(0, 20_000), WAKE_PROBE_BUDGETS_MS[0]);
+  assert.ok(nextWakeProbeMs(0, 20_000) < 5_000);
+  assert.equal(nextWakeProbeMs(9, 1_000), 1_000);
+  assert.ok(MAX_WAKE_PROBES <= 5);
+});
+
+test("cold wake succeeds on second probe and POSTs once", async () => {
+  let healthN = 0;
+  let posts = 0;
+  const events = [];
+  const r = await collectOnce({
+    env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+    onEvent: (m) => events.push(m),
+    fetchImpl: boardFetch(
+      { json: jsonRelayOk },
+      {
+        health: (_url, init) => {
+          healthN += 1;
+          if (healthN === 1) return hangingFetch(init?.signal, 20_000);
+          return healthOk();
+        },
+        ingest: async () => {
+          posts += 1;
+          return ingestOk(4);
+        },
+      },
+    ),
+  });
+  assert.equal(r.accepted, 4);
+  assert.equal(healthN, 2);
+  assert.equal(posts, 1);
+  assert.equal(r.wakeProbes, 2);
+  assert.ok(events.some((m) => /wake ok/.test(m) && /probes=2/.test(m)));
+});
+
+test("parallel wake + board: POST only after both ready", async () => {
+  const order = [];
+  let posts = 0;
+  const r = await collectOnce({
+    env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+    onEvent: () => {},
+    fetchImpl: async (url, init) => {
+      if (String(url).includes("/health")) {
+        order.push("wake");
+        await new Promise((res) => setTimeout(res, 40));
+        return healthOk();
+      }
+      if (init?.method === "POST") {
+        order.push("post");
+        posts += 1;
+        return ingestOk(4);
+      }
+      if (String(url).includes("bonbast-json")) {
+        order.push("board");
+        await new Promise((res) => setTimeout(res, 25));
+        return jsonRelayOk();
+      }
+      return { ok: false, status: 404, text: async () => "" };
+    },
+  });
+  assert.equal(r.accepted, 4);
+  assert.equal(posts, 1);
+  assert.ok(order.includes("wake"));
+  assert.ok(order.includes("board"));
+  assert.equal(order[order.length - 1], "post");
+  assert.ok(order.indexOf("wake") < order.indexOf("post"));
+  assert.ok(order.indexOf("board") < order.indexOf("post"));
+});
+
+test("wake never succeeds: no POST", async () => {
+  let posts = 0;
+  let probes = 0;
+  await assert.rejects(
+    () =>
+      collectOnce({
+        env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+        deadlineMs: Date.now() + 20_000,
+        onEvent: () => {},
+        fetchImpl: boardFetch(
+          { json: jsonRelayOk },
+          {
+            health: (_url, init) => {
+              probes += 1;
+              return hangingFetch(init?.signal, 20_000);
+            },
+            ingest: async () => {
+              posts += 1;
+              return ingestOk(4);
+            },
+          },
+        ),
+      }),
+    (e) => e instanceof CollectorError && e.code === "INGEST_WAKE_TIMEOUT",
+  );
+  assert.equal(posts, 0);
+  assert.ok(probes >= 2);
+  assert.ok(probes <= MAX_WAKE_PROBES);
+});
+
+test("POST timeout remains ambiguous: exactly one POST", async () => {
+  let posts = 0;
+  await assert.rejects(
+    () =>
+      ingestBook(
+        async (_url, init) => {
+          if (init?.method === "POST") {
+            posts += 1;
+            return hangingFetch(init.signal, 20_000);
+          }
+          return healthOk();
+        },
+        ["https://iran-pay.vercel.app/api/v1", "https://iranpay-api.onrender.com/api/v1"],
+        { secret: SECRET, book: { usd1: "1" }, timeoutMs: 60, nowMs: 1 },
+      ),
+    (e) => e instanceof CollectorError && e.code === "INGEST_POST_TIMEOUT_AMBIGUOUS",
+  );
+  assert.equal(posts, 1);
+});
+
+test("warm Render uses a single wake probe", async () => {
+  const t0 = Date.now();
+  let healthN = 0;
+  const r = await collectOnce({
+    env: { PHYSICAL_COLLECTOR_SECRET: SECRET },
+    onEvent: () => {},
+    fetchImpl: boardFetch(
+      { json: jsonRelayOk },
+      {
+        health: async () => {
+          healthN += 1;
+          return healthOk();
+        },
+      },
+    ),
+  });
+  assert.equal(r.accepted, 4);
+  assert.equal(healthN, 1);
+  assert.equal(r.wakeProbes, 1);
+  assert.ok(Date.now() - t0 < 1_500, "warm path added delay");
+});
+
+test("wake retry count is bounded", async () => {
+  let probes = 0;
+  await assert.rejects(
+    () =>
+      wakeIngestHost(async (_url, init) => {
+        probes += 1;
+        return hangingFetch(init?.signal, 20_000);
+      }, ["https://iranpay-api.onrender.com/api/v1"], {
+        timeoutMs: 30_000,
+        deadlineMs: Date.now() + 30_000,
+        onEvent: () => {},
+        sleep: async () => {},
+      }),
+    (e) => e instanceof CollectorError && e.code === "INGEST_WAKE_TIMEOUT" && e.details.probes === MAX_WAKE_PROBES,
+  );
+  assert.equal(probes, MAX_WAKE_PROBES);
 });
