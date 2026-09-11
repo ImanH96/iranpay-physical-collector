@@ -1,0 +1,69 @@
+name: production-synthetic-monitor
+
+# GitHub does not honor */5 (or even */15) as a dependable cadence on this
+# account — observed gaps are 3–5 hours on both this public repo and the
+# private IranPay workflow. A 5h keep-alive session ticks every 5 minutes
+# using free public-repo minutes. Session starts are scheduled every 4 hours.
+#
+# Do not treat workflow_dispatch as the monitoring cadence. The cadence is
+# the in-job 5-minute tick loop.
+
+on:
+  schedule:
+    - cron: "7 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: tick = one probe; session = 5h keep-alive every 5 minutes
+        type: choice
+        options:
+          - session
+          - tick
+        default: session
+
+concurrency:
+  group: production-synthetic-public
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tick'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Run one production synthetic check
+        env:
+          SYNTHETIC_API_BASE: https://iranpay-api.onrender.com
+          SYNTHETIC_WEB_BASE: https://iran-pay.vercel.app
+          SYNTHETIC_INGEST_SECRET: ${{ secrets.SYNTHETIC_INGEST_SECRET }}
+          SYNTHETIC_REQUIRE_INGEST: "1"
+          SYNTHETIC_REQUIRE_PRODUCTION: "1"
+          SYNTHETIC_RUNNER_ID: github-actions-public
+          SYNTHETIC_EXPECTED_GIT_SHA: ${{ vars.SYNTHETIC_EXPECTED_GIT_SHA }}
+        run: node scripts/synthetic-production-check.mjs
+
+  session:
+    if: github.event_name == 'schedule' || github.event.inputs.mode != 'tick'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Run 5-minute synthetic session
+        env:
+          SYNTHETIC_API_BASE: https://iranpay-api.onrender.com
+          SYNTHETIC_WEB_BASE: https://iran-pay.vercel.app
+          SYNTHETIC_INGEST_SECRET: ${{ secrets.SYNTHETIC_INGEST_SECRET }}
+          SYNTHETIC_REQUIRE_INGEST: "1"
+          SYNTHETIC_REQUIRE_PRODUCTION: "1"
+          SYNTHETIC_RUNNER_ID: github-actions-public
+          SYNTHETIC_EXPECTED_GIT_SHA: ${{ vars.SYNTHETIC_EXPECTED_GIT_SHA }}
+          SYNTHETIC_INTERVAL_MS: "300000"
+          SYNTHETIC_DURATION_MS: "17400000"
+        run: node scripts/synthetic-session.mjs
