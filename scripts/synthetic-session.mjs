@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Keep-alive synthetic session. GitHub cron cannot honor a 5-minute
- * schedule, so one public-repo job ticks the vendored runner every
- * SYNTHETIC_INTERVAL_MS until SYNTHETIC_DURATION_MS elapses.
+ * Keep-alive synthetic session. Ticks every SYNTHETIC_INTERVAL_MS until the
+ * next interval would pass SYNTHETIC_DURATION_MS, then performs the final
+ * tick and exits immediately so the workflow can dispatch the successor.
  */
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -47,12 +47,14 @@ function runTick(tick) {
 
 let tick = 0;
 let ok = 0;
-while (Date.now() < endAt) {
+let lastTickAt = null;
+for (;;) {
   tick += 1;
   if (await runTick(tick)) ok += 1;
+  lastTickAt = new Date().toISOString();
   const remaining = endAt - Date.now();
-  if (remaining <= 0) break;
-  await new Promise((r) => setTimeout(r, Math.min(intervalMs, remaining)));
+  if (remaining < intervalMs) break;
+  await new Promise((r) => setTimeout(r, intervalMs));
 }
 
 process.stdout.write(
@@ -62,6 +64,7 @@ process.stdout.write(
     sessionOk: ok,
     intervalMs,
     durationMs,
+    lastTickAt,
     endedAt: new Date().toISOString(),
   })}\n`,
 );

@@ -1,23 +1,18 @@
 name: production-synthetic-monitor
 
-# 24/7 rollover is event-driven ping-pong, not cron and not a human click.
+# 24/7 rollover: the session job dispatches the next run of THIS workflow
+# with GITHUB_TOKEN (workflow_dispatch). GitHub documents that
+# workflow_dispatch / repository_dispatch created with GITHUB_TOKEN DO
+# start a new run. workflow_run chaining is capped at 3 levels and is
+# not used.
 #
-# GitHub cron on this account has multi-hour gaps.
-# A workflow cannot listen to itself, and GITHUB_TOKEN cannot dispatch the
-# next run. So two workflows take turns:
-#   production-synthetic-monitor  --workflow_run-->  production-synthetic-rollover
-#   production-synthetic-rollover --workflow_run-->  production-synthetic-monitor
+# Cron is not used. One human workflow_dispatch starts the loop; every
+# successor is created by the previous session.
 #
-# cancelled is not chained so an operator can stop the loop. Resume once
-# with workflow_dispatch on this workflow.
-#
-# Shared concurrency group production-synthetic-public: one session at a
-# time. The next run is created only after the previous run completes.
+# Duplicate guard: one dispatch step, run_attempt==1, local sentinel.
+# Concurrency queues the successor until this job exits.
 
 on:
-  workflow_run:
-    workflows: ["production-synthetic-rollover"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       mode:
@@ -28,9 +23,9 @@ on:
           - tick
         default: session
       duration_ms:
-        description: Session length in ms. workflow_run always uses 4h50m.
+        description: Session length in ms (default 4h50m in production).
         type: string
-        default: "17400000"
+        default: "360000"
 
 concurrency:
   group: production-synthetic-public
@@ -38,9 +33,11 @@ concurrency:
 
 jobs:
   tick:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tick'
+    if: github.event.inputs.mode == 'tick'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -58,15 +55,33 @@ jobs:
         run: node scripts/synthetic-production-check.mjs
 
   session:
-    if: |
-      (github.event_name == 'workflow_run' && contains(fromJSON('["success","failure"]'), github.event.workflow_run.conclusion))
-      || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'tick')
-    uses: ./.github/workflows/synthetic-session-callable.yml
-    with:
-      duration_ms: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.duration_ms || '17400000' }}
-      predecessor_run: ${{ github.event.workflow_run.id || '' }}
-      predecessor_conclusion: ${{ github.event.workflow_run.conclusion || '' }}
-      predecessor_started: ${{ github.event.workflow_run.run_started_at || github.event.workflow_run.created_at || '' }}
-      predecessor_updated: ${{ github.event.workflow_run.updated_at || '' }}
-    secrets:
-      SYNTHETIC_INGEST_SECRET: ${{ secrets.SYNTHETIC_INGEST_SECRET }}
+    if: github.event.inputs.mode != 'tick'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Run 5-minute synthetic session
+        id: session
+        env:
+          SYNTHETIC_API_BASE: https://iranpay-api.onrender.com
+          SYNTHETIC_WEB_BASE: https://iran-pay.vercel.app
+          SYNTHETIC_INGEST_SECRET: ${{ secrets.SYNTHETIC_INGEST_SECRET }}
+          SYNTHETIC_REQUIRE_INGEST: "1"
+          SYNTHETIC_REQUIRE_PRODUCTION: "1"
+          SYNTHETIC_RUNNER_ID: github-actions-public
+          SYNTHETIC_EXPECTED_GIT_SHA: ${{ vars.SYNTHETIC_EXPECTED_GIT_SHA }}
+          SYNTHETIC_INTERVAL_MS: "300000"
+          SYNTHETIC_DURATION_MS: ${{ github.event.inputs.duration_ms || '17400000' }}
+        run: node scripts/synthetic-session.mjs
+      - name: Dispatch exactly one successor session
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/synthetic-dispatch-successor.sh
