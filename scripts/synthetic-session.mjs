@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Keep-alive synthetic session. GitHub cron cannot honor */5, so one
- * public-repo job ticks the vendored runner every SYNTHETIC_INTERVAL_MS
- * until SYNTHETIC_DURATION_MS elapses.
+ * Keep-alive synthetic session. GitHub cron cannot honor a 5-minute
+ * schedule, so one public-repo job ticks the vendored runner every
+ * SYNTHETIC_INTERVAL_MS until SYNTHETIC_DURATION_MS elapses.
  */
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
