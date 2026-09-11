@@ -1,0 +1,27 @@
+name: production-synthetic-rollover
+
+# Pair of production-synthetic-monitor. GitHub starts this when the monitor
+# workflow completes (success or failure). This workflow completing starts
+# the monitor again. No cron. No workflow_dispatch. No operator.
+
+on:
+  workflow_run:
+    workflows: ["production-synthetic-monitor"]
+    types: [completed]
+
+concurrency:
+  group: production-synthetic-public
+  cancel-in-progress: false
+
+jobs:
+  session:
+    if: contains(fromJSON('["success","failure"]'), github.event.workflow_run.conclusion)
+    uses: ./.github/workflows/synthetic-session-callable.yml
+    with:
+      duration_ms: "17400000"
+      predecessor_run: ${{ github.event.workflow_run.id }}
+      predecessor_conclusion: ${{ github.event.workflow_run.conclusion }}
+      predecessor_started: ${{ github.event.workflow_run.run_started_at || github.event.workflow_run.created_at }}
+      predecessor_updated: ${{ github.event.workflow_run.updated_at }}
+    secrets:
+      SYNTHETIC_INGEST_SECRET: ${{ secrets.SYNTHETIC_INGEST_SECRET }}
