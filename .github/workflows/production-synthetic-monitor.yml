@@ -1,25 +1,39 @@
 name: production-synthetic-monitor
 
-# GitHub does not honor */5 (or even */15) as a dependable cadence on this
-# account — observed gaps are 3–5 hours on both this public repo and the
-# private IranPay workflow. A 5h keep-alive session ticks every 5 minutes
-# using free public-repo minutes. Session starts are scheduled every 4 hours.
+# 24/7 rollover is event-driven, not cron and not a human click.
 #
-# Do not treat workflow_dispatch as the monitoring cadence. The cadence is
-# the in-job 5-minute tick loop.
+# GitHub cron on this account has multi-hour gaps, so schedule: is not used.
+# GITHUB_TOKEN cannot workflow_dispatch the next run (GitHub recursion block).
+#
+# Mechanism: when THIS workflow completes with success or failure, GitHub
+# emits workflow_run. That event starts the next session on main. The new
+# run's event is workflow_run — no operator, no cron.
+#
+# cancelled is not chained so an operator can stop the loop. After a stop,
+# resume once with workflow_dispatch; the chain continues from there.
+# A fast failed predecessor backs off 8 minutes to avoid a crash loop
+# while staying under the 15-minute SYNTHETIC:RUNNER:STALE threshold.
+#
+# Concurrency group allows only one session. The next run is created after
+# the previous run completes, so ticks do not overlap.
 
 on:
-  schedule:
-    - cron: "7 */4 * * *"
+  workflow_run:
+    workflows: ["production-synthetic-monitor"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       mode:
-        description: tick = one probe; session = 5h keep-alive every 5 minutes
+        description: tick = one probe; session = keep-alive every 5 minutes
         type: choice
         options:
           - session
           - tick
         default: session
+      duration_ms:
+        description: Session length in ms. Empty uses 4h50m. workflow_run always uses 4h50m.
+        type: string
+        default: "17400000"
 
 concurrency:
   group: production-synthetic-public
@@ -47,10 +61,37 @@ jobs:
         run: node scripts/synthetic-production-check.mjs
 
   session:
-    if: github.event_name == 'schedule' || github.event.inputs.mode != 'tick'
+    if: |
+      (github.event_name == 'workflow_run' && contains(fromJSON('["success","failure"]'), github.event.workflow_run.conclusion))
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'tick')
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Announce rollover trigger
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "this_run=${{ github.run_id }}"
+          echo "predecessor_run=${{ github.event.workflow_run.id }}"
+          echo "predecessor_conclusion=${{ github.event.workflow_run.conclusion }}"
+          echo "predecessor_event=${{ github.event.workflow_run.event }}"
+      - name: Back off after a short failed predecessor
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
+        run: |
+          python3 - <<'PY'
+          import datetime, os, time
+          created = os.environ["PRED_CREATED"]
+          updated = os.environ["PRED_UPDATED"]
+          c = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+          u = datetime.datetime.fromisoformat(updated.replace("Z", "+00:00"))
+          sec = (u - c).total_seconds()
+          print(f"predecessor_duration_s={sec:.1f}")
+          if sec < 120:
+              print("short_failed_predecessor_backoff_s=480")
+              time.sleep(480)
+          PY
+        env:
+          PRED_CREATED: ${{ github.event.workflow_run.run_started_at || github.event.workflow_run.created_at }}
+          PRED_UPDATED: ${{ github.event.workflow_run.updated_at }}
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
@@ -65,5 +106,5 @@ jobs:
           SYNTHETIC_RUNNER_ID: github-actions-public
           SYNTHETIC_EXPECTED_GIT_SHA: ${{ vars.SYNTHETIC_EXPECTED_GIT_SHA }}
           SYNTHETIC_INTERVAL_MS: "300000"
-          SYNTHETIC_DURATION_MS: "17400000"
+          SYNTHETIC_DURATION_MS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.duration_ms || '17400000' }}
         run: node scripts/synthetic-session.mjs

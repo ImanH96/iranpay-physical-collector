@@ -55,5 +55,14 @@ while (Date.now() < endAt) {
   await new Promise((r) => setTimeout(r, Math.min(intervalMs, remaining)));
 }
 
-process.stdout.write(`${JSON.stringify({ sessionTicks: tick, sessionOk: ok, intervalMs, durationMs })}\n`);
+process.stdout.write(
+  `${JSON.stringify({
+    sessionEnd: true,
+    sessionTicks: tick,
+    sessionOk: ok,
+    intervalMs,
+    durationMs,
+    endedAt: new Date().toISOString(),
+  })}\n`,
+);
 process.exit(ok > 0 ? 0 : 1);
